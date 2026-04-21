@@ -4,10 +4,12 @@ from fastapi import FastAPI, HTTPException, Path, Body
 from pydantic import BaseModel
 from typing import Optional, List
 from dotenv import load_dotenv
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 load_dotenv()
 
 app = FastAPI(title="FeedbackService")
+
 
 # -----------------------------
 # Database connection
@@ -31,81 +33,75 @@ def get_db():
 
     return pyodbc.connect(conn_str)
 
+
+# -----------------------------
+# Service Bus sender
+# -----------------------------
+def send_message_to_queue(message: str):
+    conn_str = os.getenv("SERVICEBUS_SEND")
+    queue_name = os.getenv("QUEUE_NAME")
+
+    if not conn_str or not queue_name:
+        # В учебном проекте можно просто залогировать,
+        # чтобы не падать, если переменные не заданы
+        print("Service Bus config is missing, message not sent:", message)
+        return
+
+    with ServiceBusClient.from_connection_string(conn_str) as client:
+        sender = client.get_queue_sender(queue_name)
+        with sender:
+            sender.send_messages(ServiceBusMessage(message))
+
+
 # ============================================================
 # MODELS
 # ============================================================
-
 class FeedbackIn(BaseModel):
     feedbackId: Optional[int] = None
     conferenceId: int
     rating: int
     comment: Optional[str] = None
 
+
 class FeedbackOut(FeedbackIn):
     feedbackId: int
     createdAt: str
 
+
 # ============================================================
 # INIT (должен быть выше динамических маршрутов)
 # ============================================================
-
 @app.get("/api/feedback/init")
 def init_feedback_table():
     with get_db() as conn:
         cursor = conn.cursor()
 
-        # Создаём схему, если её нет
         cursor.execute("""
-        IF NOT EXISTS (
-            SELECT * FROM sys.schemas WHERE name = 'HannaIvanova'
-        )
-        EXEC('CREATE SCHEMA HannaIvanova')
+        IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'ConferenceSystem')
+            EXEC('CREATE SCHEMA ConferenceSystem')
         """)
 
-        # Создаём таблицу Feedback
         cursor.execute("""
         IF NOT EXISTS (
             SELECT * FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA='HannaIvanova' AND TABLE_NAME='Feedback'
+            WHERE TABLE_SCHEMA = 'ConferenceSystem' AND TABLE_NAME = 'Feedback'
         )
-        CREATE TABLE HannaIvanova.Feedback (
+        CREATE TABLE ConferenceSystem.Feedback (
             feedbackId INT IDENTITY(1,1) PRIMARY KEY,
             conferenceId INT NOT NULL,
             rating INT NOT NULL,
             comment NVARCHAR(MAX),
-            createdAt DATETIME NOT NULL DEFAULT GETDATE(),
-            FOREIGN KEY (conferenceId) REFERENCES HannaIvanova.Conference(conferenceId)
+            createdAt DATETIME NOT NULL DEFAULT GETDATE()
         )
         """)
 
         conn.commit()
         return {"status": "OK", "message": "Feedback table created"}
 
-# ============================================================
-# SEED
-# ============================================================
-
-@app.get("/api/feedback/seed")
-def seed_feedback():
-    with get_db() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO HannaIvanova.Feedback (conferenceId, rating, comment)
-            VALUES
-            (1, 5, 'Amazing keynote!'),
-            (1, 4, 'Very informative'),
-            (2, 3, 'Good but long'),
-            (3, 5, 'Excellent!')
-        """)
-
-        conn.commit()
-        return {"status": "seeded"}
 
 # ============================================================
 # GET ALL
 # ============================================================
-
 @app.get("/api/feedback", response_model=List[FeedbackOut])
 def get_feedback():
     with get_db() as conn:
@@ -113,7 +109,7 @@ def get_feedback():
 
         cursor.execute("""
             SELECT feedbackId, conferenceId, rating, comment, createdAt
-            FROM HannaIvanova.Feedback
+            FROM ConferenceSystem.Feedback
         """)
 
         rows = cursor.fetchall()
@@ -129,10 +125,10 @@ def get_feedback():
             for row in rows
         ]
 
+
 # ============================================================
 # GET ONE (динамический — должен быть ниже статических)
 # ============================================================
-
 @app.get("/api/feedback/{feedbackId}", response_model=FeedbackOut)
 def get_feedback_item(feedbackId: int = Path(...)):
     with get_db() as conn:
@@ -140,7 +136,7 @@ def get_feedback_item(feedbackId: int = Path(...)):
 
         cursor.execute("""
             SELECT feedbackId, conferenceId, rating, comment, createdAt
-            FROM HannaIvanova.Feedback
+            FROM ConferenceSystem.Feedback
             WHERE feedbackId = ?
         """, feedbackId)
 
@@ -156,10 +152,10 @@ def get_feedback_item(feedbackId: int = Path(...)):
             createdAt=str(row[4])
         )
 
+
 # ============================================================
 # UPSERT
 # ============================================================
-
 @app.post("/api/feedback/upsert")
 def upsert_feedback(data: FeedbackIn = Body(...)):
     with get_db() as conn:
@@ -171,14 +167,14 @@ def upsert_feedback(data: FeedbackIn = Body(...)):
         # UPDATE
         if data.feedbackId:
             cursor.execute(
-                "SELECT feedbackId FROM HannaIvanova.Feedback WHERE feedbackId = ?",
+                "SELECT feedbackId FROM ConferenceSystem.Feedback WHERE feedbackId = ?",
                 data.feedbackId
             )
             if not cursor.fetchone():
                 raise HTTPException(404, "Feedback not found")
 
             cursor.execute("""
-                UPDATE HannaIvanova.Feedback
+                UPDATE ConferenceSystem.Feedback
                 SET conferenceId=?, rating=?, comment=?
                 WHERE feedbackId=?
             """, (
@@ -193,7 +189,7 @@ def upsert_feedback(data: FeedbackIn = Body(...)):
 
         # CREATE
         cursor.execute("""
-            INSERT INTO HannaIvanova.Feedback (conferenceId, rating, comment, createdAt)
+            INSERT INTO ConferenceSystem.Feedback (conferenceId, rating, comment, createdAt)
             OUTPUT INSERTED.feedbackId
             VALUES (?, ?, ?, GETDATE())
         """, (
@@ -204,5 +200,8 @@ def upsert_feedback(data: FeedbackIn = Body(...)):
 
         new_id = cursor.fetchone()[0]
         conn.commit()
+
+        # отправка сообщения в очередь по триггеру создания
+        send_message_to_queue(f"New feedback created: {new_id}")
 
         return {"status": "created", "feedbackId": new_id}
