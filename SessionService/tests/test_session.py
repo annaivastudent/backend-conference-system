@@ -16,7 +16,7 @@ def test_time_validation():
     assert response.status_code == 400
 
 
-@patch("main.get_db")
+@patch("SessionService.main.get_db")
 def test_create_session(mock_db):
     mock_conn = mock_db.return_value.__enter__.return_value
     mock_cursor = mock_conn.cursor.return_value
